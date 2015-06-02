@@ -1,0 +1,158 @@
+---
+title: iRefIndex network generation
+author: Keith Hughitt
+date: 2015/05/26
+output:
+  md_document:
+    variant: markdown_github
+---
+
+### Load iRefIndex annotations
+
+```{r load_irefr}
+library('iRefR')
+library('dplyr')
+library('readr')
+
+# Settings
+target_species = 'Mus musculus'
+
+if (target_species == 'Homo sapiens') {
+    taxon_id    = 9606
+} else if (target_species == 'Mus musculus') {
+    taxon_id    = 10090
+}
+
+# Organism-specific info
+orgdb_name = sub(' ', '.', target_species)
+taxon_field = sprintf('taxid:%s(%s)', taxon_id, target_species)
+
+# Load human interaction data
+input_dir = file.path(Sys.getenv('REF'), 'irefindex', '14.0')
+
+# 2015/05/26 There appears to be a bug which resulted in the compressed
+# .txt.zip having a different name from the .txt itself (0407 vs. 0704)
+compressed_file = file.path(input_dir, sprintf('%s.mitab.07042015.txt.zip',
+                                                taxon_id))
+network_filename = sprintf('%s.mitab.04072015.txt', taxon_id)
+
+# Load iRefIndex
+iref = unique(read_delim(
+    unz(description=compressed_file, filename=network_filename), 
+    delim='\t', quote=''
+))
+
+# fix first colname
+colnames(iref) = c('uidA', colnames(iref)[-c(1)])
+
+# remove cross-species ixns
+iref = iref %>% filter(taxa == taxon_field & taxb == taxon_field)
+```
+
+### Convert protein ids to entrez gene ids
+
+**NOTE**
+
+Occasionally icrogids will map to more than one gene identifier.  For example,
+icrogid 4397381 maps to Entrez gene ids "100271849" and "4207", which
+correspond to "MEF2B myocyte enhancer factor 2B" and "EF2BNB-MEF2B
+MEF2BNB-MEF2B readthrough".
+
+To keep things simple for now, whenever there is more than one possible
+mapped id, we will keep the first id matched.
+
+```{r load_mapping}
+# load mapping
+#mapping_file = file.path(input_dir, sprintf('%s.RData', 
+#                                            '9606.mitab.04072015.conversion_table'))
+
+## If mapping file already exists, load it it in
+#if (file.exists(mapping_file)) {
+#    load(mapping_file)
+#    id_mapping = extended_table
+#    rm(extended_table)
+#} else {
+    # Otherwise, generate a mapping
+id_mapping = create_id_conversion_table(
+    iref, input_dir, sprintf('%s.mitab.04072015.conversion_table', taxon_id))
+#}
+```
+    
+```{r convert_protein_ids}
+# Source protein
+gene_ids_a = c()
+
+for (x in iref$icrogida) {
+    gene_ids = convert_protein_ID('icrogid', x, 'entrezgene/locuslink', id_mapping)
+    gene_ids = gene_ids[1]
+    gene_ids_a = append(gene_ids_a, gene_ids)
+}
+
+# Target protein
+gene_ids_b = c()
+
+for (x in iref$icrogidb) {
+    gene_ids = convert_protein_ID('icrogid', x, 'entrezgene/locuslink', id_mapping)
+    gene_ids = gene_ids[1]
+
+    gene_ids_b = append(gene_ids_b, gene_ids)
+}
+
+# Drop edges for which the source and target proteins could not both be mapped
+# to Entrez genes
+mask = !(is.na(gene_ids_a) | is.na(gene_ids_b))
+
+gene_ids_a = gene_ids_a[mask]
+gene_ids_b = gene_ids_b[mask]
+```
+
+### Convert to ENSEMBL IDs
+
+```{r convert_to_ensembl}
+# Load OrganismDb
+library(orgdb_name, character.only=TRUE)
+orgdb = get(orgdb_name)
+
+# Create a mapping for all of the observed ENTREZ ids
+entrez_to_ensembl_mapping = AnnotationDbi::select(
+    orgdb, keys=gene_ids_a, keytype='ENTREZID', columns=c('ENSEMBL', 'GENENAME')
+)
+
+# Convert source and target gene ids
+ensembl_ids_a = entrez_to_ensembl_mapping$ENSEMBL[
+    match(gene_ids_a, entrez_to_ensembl_mapping$ENTREZID)
+]
+ensembl_ids_b = entrez_to_ensembl_mapping$ENSEMBL[
+    match(gene_ids_b, entrez_to_ensembl_mapping$ENTREZID)
+]
+```
+
+### Save resulting network
+
+```{r save_ppi_network}
+# create output dataframe
+result = data.frame(a=ensembl_ids_a, b=ensembl_ids_b)
+
+# remove any rows containing one or more NAs
+result = result[complete.cases(result),]
+
+# remove duplicate entries
+result = result[!duplicated(result),]
+
+# sort result
+result = result[with(result, order(a,b)),]
+
+# write output
+outfile = sub('.mitab', '', sub('txt.zip', 'ensembl.csv', compressed_file))
+write.csv(result, outfile, quote=FALSE, row.names=FALSE)
+
+# gzip output
+system(sprintf('(gzip -f %s) &', outfile))
+```
+
+System information
+------------------
+
+```{r results='asis'}
+toLatex(sessionInfo())
+```
